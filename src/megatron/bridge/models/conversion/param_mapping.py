@@ -1991,31 +1991,31 @@ class RMSNorm2ZeroCenteredRMSNormMapping(AutoMapping):
 
 class GDNConv1dComponentMapping(MegatronParamMapping[torch.Tensor]):
     """
-    Mapping for one component (q, k, or v) of GDN conv1d.
+    Maps one component (q, k, or v) of conv1d.
 
-    HF stores one combined conv1d weight: [Q_all | K_all | V_all]
-    Megatron uses 3 separate conv1d: q_conv1d, k_conv1d, v_conv1d
+    HF stores: [Q_all | K_all | V_all] (packed) - one tensor
+    Megatron stores: q_conv1d, k_conv1d, v_conv1d - three tensors
 
-    Each instance of this mapping extracts one component.
+    All three components cache their weights during export.
+    When all three are collected, they are merged into single HF tensor.
     """
 
-    def __init__(self, megatron_param: str, hf_param: str, component: str):
-        """
-        Args:
-            megatron_param: Megatron parameter name (e.g., "...q_conv1d.weight")
-            hf_param: HF parameter name (e.g., "...conv1d.weight")
-            component: Which component to extract ("q", "k", or "v")
-        """
-        super().__init__(megatron_param, hf_param)
-        assert component in ("q", "k", "v"), f"component must be 'q', 'k', or 'v', got '{component}'"
-        self.component = component
-        self._col_mapping = ColumnParallelMapping(megatron_param, hf_param)
+    # Class-level cache: {parent_path: {"q": tensor, "k": tensor, "v": tensor}}
+    _export_cache: Dict[str, Dict[str, torch.Tensor]] = {}
 
-    def _extract_component(self, hf_weights: torch.Tensor, config) -> torch.Tensor:
-        """Extract q, k, or v component from combined conv1d weight."""
+    def __init__(self, megatron_param: str, hf_param: str, component: str):
+        super().__init__(megatron_param, hf_param)
+        assert component in ("q", "k", "v")
+        self.component = component
+
+    def _get_split_sizes(self, config):
         qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
         v_dim = config.linear_value_head_dim * config.linear_num_value_heads
+        return qk_dim, qk_dim, v_dim
 
+    def _extract_component(self, hf_weights: torch.Tensor, config) -> torch.Tensor:
+        """Extract q, k, or v component from packed HF tensor."""
+        qk_dim, _, v_dim = self._get_split_sizes(config)
         q, k, v = torch.split(hf_weights, [qk_dim, qk_dim, v_dim], dim=0)
 
         if self.component == "q":
@@ -2031,20 +2031,29 @@ class GDNConv1dComponentMapping(MegatronParamMapping[torch.Tensor]):
         megatron_module: nn.Module,
     ) -> torch.Tensor:
         """Extract component and distribute to TP ranks."""
+        normalized_param = self._normalize_expert_param_name(self.megatron_param)
+        _, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
+
         if self.tp_rank == 0:
             config = self._get_config(megatron_module)
             component_weights = self._extract_component(hf_weights, config)
         else:
             component_weights = None
 
-        # Delegate to ColumnParallelMapping for TP distribution
-        # Need to update the internal mapping's groups
-        self._col_mapping._tp_group = self._tp_group
-        self._col_mapping._etp_group = self._etp_group
-        self._col_mapping.pp_group = self.pp_group
-        self._col_mapping.ep_group = self.ep_group
+        if self.tp_size == 1:
+            return component_weights
 
-        return self._col_mapping.hf_to_megatron(component_weights, megatron_module)
+        if self.tp_rank == 0:
+            splits = torch.chunk(component_weights, self.tp_size, dim=0)
+        else:
+            splits = None
+
+        return self.scatter_to_tp_ranks(
+            splits,
+            target_param.shape,
+            target_param.dtype,
+            target_param.device,
+        )
 
     def megatron_to_hf(
         self,
@@ -2052,37 +2061,60 @@ class GDNConv1dComponentMapping(MegatronParamMapping[torch.Tensor]):
         megatron_module: Optional[nn.Module],
     ) -> Dict[str, torch.Tensor]:
         """
-        Gather component from TP ranks.
-
-        Note: This returns just this component. The caller (or a separate
-        aggregation step) must combine q, k, v back into the full HF tensor.
-        For now, we return with a component-specific key that can be
-        post-processed.
+        Each component caches its weight.
+        When all three (q, k, v) are collected, merge and return.
         """
-        # Handle cross-PP broadcast
-        megatron_weights = self.broadcast_from_pp_rank(megatron_weights, cache_key=str(self.megatron_param))
+        # Broadcast for PP
+        weight = self.broadcast_from_pp_rank(megatron_weights, cache_key=self.megatron_param)
 
-        if megatron_weights is None:
+        if weight is None:
             return {}
 
-        # Dequantize if needed
-        megatron_weights = self.maybe_dequantize(megatron_weights)
+        weight = self.maybe_dequantize(weight)
 
-        if self.tp_size == 1:
-            full_weights = megatron_weights
+        # Gather from TP ranks
+        if self.tp_size > 1:
+            gathered = self.gather_from_tp_ranks(weight)
+            full_weight = torch.cat(gathered, dim=0)
         else:
-            # Gather from all TP ranks
-            gathered = self.gather_from_tp_ranks(megatron_weights)
-            full_weights = torch.cat(gathered, dim=0)
+            full_weight = weight
 
-        # Return with component suffix for later aggregation
-        # The export pipeline should aggregate these into the single HF param
-        return {f"{self.hf_param}.__{self.component}__": full_weights}
+        # Parent path for grouping (e.g. "decoder.layers.0.self_attention")
+        parent_path = self.megatron_param.rsplit(".", 2)[0]
 
-    def resolve(self, captures: Tuple[str, ...]) -> "MegatronParamMapping":
-        """Create resolved mapping preserving component."""
-        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
-        return type(self)(resolved_megatron_param, resolved_hf_param, self.component)
+        # Initialize cache for this layer if needed
+        if parent_path not in GDNConv1dComponentMapping._export_cache:
+            GDNConv1dComponentMapping._export_cache[parent_path] = {}
+
+        # Store this component
+        GDNConv1dComponentMapping._export_cache[parent_path][self.component] = full_weight
+
+        # Check if all three components are ready
+        cache = GDNConv1dComponentMapping._export_cache[parent_path]
+        if len(cache) < 3:
+            # Not all components collected yet, return empty
+            return {}
+
+        # All three ready - merge!
+        q_weight = cache["q"]
+        k_weight = cache["k"]
+        v_weight = cache["v"]
+
+        merged = torch.cat([q_weight, k_weight, v_weight], dim=0)
+
+        # Clean up cache for this layer
+        del GDNConv1dComponentMapping._export_cache[parent_path]
+
+        return {self.hf_param: merged}
+
+    def resolve(self, captures: Tuple[str, ...]) -> "GDNConv1dComponentMapping":
+        resolved_megatron, resolved_hf = self._resolve_names(captures)
+        return type(self)(resolved_megatron, resolved_hf, self.component)
+
+    @classmethod
+    def clear_cache(cls):
+        """Clear export cache. Call before starting new export."""
+        cls._export_cache.clear()
 
 
 def merge_qkv_biases(config: TransformerConfig, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
