@@ -140,6 +140,7 @@ class Qwen3NextBridge(MegatronModelBridge):
         AutoMapping.register_module_type("GatedDeltaNet", "column")
 
         # Add special mappings that require parameter concatenation/transformation
+        _gdn_conv_export_cache = {}
         mapping_list.extend(
             [
                 # QKV: Combine separate Q, K, V matrices into single QKV matrix
@@ -168,16 +169,19 @@ class Qwen3NextBridge(MegatronModelBridge):
                     megatron_param="decoder.layers.*.self_attention.q_conv1d.weight",
                     hf_param="model.layers.*.linear_attn.conv1d.weight",
                     component="q",
+                    export_cache=_gdn_conv_export_cache,
                 ),
                 GDNConv1dComponentMapping(
                     megatron_param="decoder.layers.*.self_attention.k_conv1d.weight",
                     hf_param="model.layers.*.linear_attn.conv1d.weight",
                     component="k",
+                    export_cache=_gdn_conv_export_cache,
                 ),
                 GDNConv1dComponentMapping(
                     megatron_param="decoder.layers.*.self_attention.v_conv1d.weight",
                     hf_param="model.layers.*.linear_attn.conv1d.weight",
                     component="v",
+                    export_cache=_gdn_conv_export_cache,
                 ),
                 # Gated MLP of experts
                 GatedMLPMapping(

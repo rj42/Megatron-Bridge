@@ -2000,13 +2000,11 @@ class GDNConv1dComponentMapping(MegatronParamMapping[torch.Tensor]):
     When all three are collected, they are merged into single HF tensor.
     """
 
-    # Class-level cache: {parent_path: {"q": tensor, "k": tensor, "v": tensor}}
-    _export_cache: Dict[str, Dict[str, torch.Tensor]] = {}
-
-    def __init__(self, megatron_param: str, hf_param: str, component: str):
+    def __init__(self, megatron_param: str, hf_param: str, component: str, export_cache: dict):
         super().__init__(megatron_param, hf_param)
         assert component in ("q", "k", "v")
         self.component = component
+        self._export_cache = export_cache
 
     def _get_split_sizes(self, config):
         qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
@@ -2083,14 +2081,14 @@ class GDNConv1dComponentMapping(MegatronParamMapping[torch.Tensor]):
         parent_path = self.megatron_param.rsplit(".", 2)[0]
 
         # Initialize cache for this layer if needed
-        if parent_path not in GDNConv1dComponentMapping._export_cache:
-            GDNConv1dComponentMapping._export_cache[parent_path] = {}
+        if parent_path not in self._export_cache:
+            self._export_cache[parent_path] = {}
 
         # Store this component
-        GDNConv1dComponentMapping._export_cache[parent_path][self.component] = full_weight
+        self._export_cache[parent_path][self.component] = full_weight
 
         # Check if all three components are ready
-        cache = GDNConv1dComponentMapping._export_cache[parent_path]
+        cache = self._export_cache[parent_path]
         if len(cache) < 3:
             # Not all components collected yet, return empty
             return {}
@@ -2103,18 +2101,13 @@ class GDNConv1dComponentMapping(MegatronParamMapping[torch.Tensor]):
         merged = torch.cat([q_weight, k_weight, v_weight], dim=0)
 
         # Clean up cache for this layer
-        del GDNConv1dComponentMapping._export_cache[parent_path]
+        del self._export_cache[parent_path]
 
         return {self.hf_param: merged}
 
     def resolve(self, captures: Tuple[str, ...]) -> "GDNConv1dComponentMapping":
         resolved_megatron, resolved_hf = self._resolve_names(captures)
-        return type(self)(resolved_megatron, resolved_hf, self.component)
-
-    @classmethod
-    def clear_cache(cls):
-        """Clear export cache. Call before starting new export."""
-        cls._export_cache.clear()
+        return type(self)(resolved_megatron, resolved_hf, self.component, self._export_cache)
 
 
 def merge_qkv_biases(config: TransformerConfig, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
